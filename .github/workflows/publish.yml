@@ -1,0 +1,92 @@
+name: publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/configure-pages@v6
+
+      - name: Build the F-Droid repo from each app's newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FDROID_KEYSTORE: ${{ secrets.FDROID_KEYSTORE }}
+          FDROID_KEYSTORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+        run: |
+          work="$RUNNER_TEMP/fdroid"
+          cp -r fdroid "$work"
+          chmod 600 "$work/config.yml"
+          echo "$FDROID_KEYSTORE" | base64 -d > "$work/keystore.p12"
+          mkdir "$work/repo"
+          for meta in fdroid/metadata/*.yml; do
+            appid=$(basename "$meta" .yml)
+            src=$(sed -n 's|^SourceCode: https://github.com/||p' "$meta")
+            tag=$(gh release view --repo "$src" --json tagName --jq .tagName)
+            gh release download "$tag" --repo "$src" --pattern '*.apk' --dir "$work/repo"
+            mkdir -p "$work/build/$appid"
+            gh api "repos/$src/tarball/$tag" | tar -xz -C "$work/build/$appid" --strip-components=1 --wildcards '*/fastlane/metadata/android'
+          done
+          (cd "$work" && pipx run --spec fdroidserver==2.4.5 fdroid update)
+          fingerprint=$(keytool -exportcert -storetype PKCS12 -keystore "$work/keystore.p12" -storepass:env FDROID_KEYSTORE_PASSWORD -alias machtvapps \
+            | sha256sum | awk '{print toupper($1)}')
+          echo "F-Droid repository fingerprint: $fingerprint"
+          echo "REPO_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
+          mkdir -p _site/fdroid
+          cp -r site/. _site/
+          cp -r "$work/repo" _site/fdroid/
+
+      - name: Put the fingerprint and each app on the page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FDROID_BUILD: ${{ runner.temp }}/fdroid/build
+        run: |
+          python3 - <<'EOF'
+          import html, json, os, re, subprocess
+          from pathlib import Path
+
+          def row(meta):
+              repo = re.search(r'^SourceCode: https://github\.com/(\S+)$', meta.read_text(), re.M).group(1)
+              name = Path(os.environ['FDROID_BUILD'], meta.stem, 'fastlane/metadata/android/en-US/title.txt').read_text().strip()
+              out = subprocess.run(['gh', 'api', f'repos/{repo}/releases/latest'], check=True, capture_output=True, text=True).stdout
+              tag = json.loads(out)['tag_name']
+              return name, (
+                  f'      <li><a href="https://github.com/{html.escape(repo)}">{html.escape(name)}</a>'
+                  f'<span>{html.escape(tag)}</span>'
+                  f'<span><code>{html.escape(meta.stem)}</code>'
+                  f'<button type="button" hidden data-copy="{html.escape(meta.stem)}">copy</button></span></li>'
+              )
+
+          rows = sorted((row(meta) for meta in Path('fdroid/metadata').glob('*.yml')), key=lambda r: r[0].casefold())
+          page = Path('_site/index.html')
+          text = page.read_text()
+          assert text.count('<!-- fdroid apps -->') == 1
+          assert text.count('REPO_FINGERPRINT') == 2
+          text = text.replace('<!-- fdroid apps -->', '\n'.join(r[1] for r in rows))
+          text = text.replace('REPO_FINGERPRINT', os.environ['REPO_FINGERPRINT'])
+          page.write_text(text)
+          EOF
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
